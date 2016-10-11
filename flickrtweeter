@@ -1,0 +1,265 @@
+#!/usr/bin/perl -w
+#-*-cperl-*-
+
+# Copyright 2009, Sam Pearson <sam@sgp.me.uk>
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+use strict;
+use Fcntl;
+use Storable;
+use XML::Simple;
+use LWP::Simple;
+use Net::Twitter;
+use URI::Escape;
+
+## Configurable variables
+
+# Set this to the URL of the Atom 1.0 feed for the Flickr photostream to poll
+my $flickr_atom_feed  = '';
+
+# Set this to the tag used to flag picutres you wanted tweeted
+my $twitter_tag       = '';
+
+# Set this to the string you would like to prefix your tweets with.
+# They will take the form "$tweet_prefix <Photo Title> <bit.ly URL>"
+my $tweet_prefix      = '';
+
+# These should be fairly obvious from the names of the variables
+my $bitly_username    = '';
+my $bitly_apikey      = '';
+my $twitter_username  = '';
+my $twitter_password  = '';
+
+# Set the following variables to the full file path where you want to store
+# the files specfied in the variable names.  The cachefile will contain a list
+# of the pictures tweeted, the lockfile is just that and the logfile contains
+# diagnostic messages.  If you want to turn off logging, just leave $logfile unset.
+my $cachefile         = '';
+my $lockfile          = '';
+my $logfile           = '';
+
+# This variable controls what the script does if $cachefile does not exist: set to '' or '0'
+# to disable tweets for anything it finds tagged with the $twitter_tag in the photstream the
+# first time the script runs, or to pretty much anything else to tweet these pictures.
+# NB: It is recommended to set this to 0 after the first run in case the cachefile become
+# corrupted or gets deleted as this will prevent bulk re-tweets of pictures already posted.
+my $twit_on_first_run = '0';
+
+## Non-configurable variables
+
+my $first_run         = '0';
+my %cache;
+my %pics2tweet;
+
+## Subroutines
+
+sub _get_bitly_uri {
+  # Expects: URL to shorten, bit.ly user name, bit.ly API key
+  # Returns: bit.ly error code, short URL | error message
+  my( $longUrl, $login, $apiKey ) = @_;
+  my $request = join( "",
+		       'http://api.bit.ly/shorten?version=2.0.1&format=xml',
+		       '&longUrl=',"$longUrl",
+		       '&login=',"$login",
+		       '&apiKey=',"$apiKey");
+  my $reply   = get($request);
+  my $bitly   = XMLin($reply);
+  my $message = "$bitly->{errorCode}" eq "0" ? $bitly->{results}->{nodeKeyVal}->{shortUrl} : $bitly->{errorMessage};
+  return "$bitly->{errorCode}", "$message";
+}
+
+sub _send_tweet {
+  my( $status, $username, $password ) = @_;
+  my $useragent = "Flickrtweeter";
+  my $twit = Net::Twitter->new(username  => "$username",
+			       password  => "$password",
+			       useragent => "$useragent");
+  my $response = $twit->update("$status");
+  return $response;
+}
+
+sub _close_lockfile {
+  my( $fh, $fn ) = @_;
+  ( close $fh and unlink $fn )
+    ? return 1
+      : return undef;
+}
+
+sub _write_log {
+  my( $fh, $message ) = @_;
+  print $fh time(),"\t$$\t$message\n";
+}
+
+## Main
+
+# Set up lockfile.  If it exists, exit, otherwise create it and
+# print in the PID so that we can troubleshoot if necessary.
+sysopen(LOCKFILE, $lockfile, O_RDWR | O_EXCL | O_CREAT)
+  ? print LOCKFILE "$$"
+  : die "$lockfile already appears to exist, exiting.\n";
+
+# Open log file:
+if ( $logfile ) {
+  open(LOG, ">>", "$logfile") or do {
+    _close_lockfile(*LOCKFILE,"$lockfile");
+    die "Can't open $logfile for appending, exiting.\n";
+  };
+}
+
+# Load any data into %cache from $cachefile if it exists.
+-e $cachefile
+  ? %cache = %{ retrieve $cachefile }
+  : $first_run = "1";
+
+# GET the Flickr atom feed.
+my $feed = get($flickr_atom_feed);
+$feed or do {
+  $logfile and _write_log(*LOG,"Can't GET $flickr_atom_feed, exiting 1");
+  _close_lockfile(*LOCKFILE,"$lockfile");
+  exit 1;
+};
+
+# parse the atom file using XML::Simple into a nice
+# perl-friendly data structure.  We'll force single
+# category elements into an array to simplify processing.
+my $xml = XMLin($feed, ForceArray => ['category']);
+
+# go over each picture.  Note the XML::Simple uses the id element
+# of each <entry> as its key in the hash it builds.
+PICTURE: foreach my $picture ( keys %{ $xml->{entry} } ) {
+
+  # if this id is already in our cache, skip.
+  next PICTURE if $cache{$picture};
+
+  # do we have any categories defined?
+  if ( $xml->{entry}->{$picture}->{category} ) {
+
+    # go through each one to see whether we have a $twitter_tag match
+    foreach my $category ( @{ $xml->{entry}->{$picture}->{category} } ) {
+
+      # if we get a $twitter_tag match:
+      if ( "$category->{term}" eq "$twitter_tag" ) {
+
+	my $picture_title = ${ $xml->{entry}->{$picture} }{title};
+	my $picture_url;
+
+	# look for a link element with rel=alternate (others may be enclosure or license)
+      LINK: foreach my $link ( @{ $xml->{entry}->{$picture}->{link} } ) {
+	  if ( "$link->{rel}" eq "alternate" ) {
+	    $picture_url = $link->{href};
+	    last LINK;
+	  }
+	}
+
+	# Add the picture to our hash of pictures we need to tweet,
+	# using the <id> as key for a hash of attributes.
+	$pics2tweet{$picture} = {
+				 href => $picture_url,
+				 title => $picture_title,
+				};
+
+	# Short-circuit any further category checks and skip to the next $picture
+	next PICTURE;
+      }
+
+    }
+  }
+}
+
+# We only need to do anything else if there is anything in %pics2tweet.
+if ( %pics2tweet ) {
+
+  # We should now have a data structure of pictures that need tweets in $picts2tweet.
+  # Now obtain a nice short URL from bit.ly or log an error and remove the pic from
+  # the hash as we'll be unable to complete the status update without a short url.
+  foreach my $picture_id ( keys %pics2tweet ) {
+    my $escaped_href = uri_escape($pics2tweet{$picture_id}{href});
+    my( $bitly_errorCode, $bitly_message ) = _get_bitly_uri("$escaped_href","$bitly_username","$bitly_apikey");
+    if ( "$bitly_errorCode" eq "0" ) {
+      $pics2tweet{$picture_id}{shortUrl} = $bitly_message;
+    }
+    else {
+      $logfile and _write_log(*LOG,"Failed to get shortened URL for $picture_id, bit.ly said: error code $bitly_errorCode, error message: $bitly_message.  Removing $picture_id from list of pics to tweet.");
+      delete $pics2tweet{$picture_id};
+    }
+  }
+
+  # If bit.ly isn't functioning at all, we'll have nothing left in %pics2tweet.
+  unless ( %pics2tweet ) {
+    $logfile and _write_log(*LOG,"Nothing remains in the list of pics to tweet.  Exiting without taking any further action.");
+    unless ( _close_lockfile(*LOCKFILE,"$lockfile") ) {
+      if ( $logfile) {
+	_write_log(*LOG,"Problem closing lockfile.");
+      }
+    }
+    $logfile and close(LOG);
+    exit 1;
+  }
+
+  # Now we have a hash of pics that are not in our cache file, assuming one exists.
+  # If the cache file exists, or does not but $twit_on_first_run is defined, we want to
+  # send tweets for the contents of %pics2tweet.
+  if ( ( not $first_run ) or ( $first_run and $twit_on_first_run ) ) {
+    foreach my $pic2twit ( keys %pics2tweet ) {
+
+      # build status string:
+      my $status = "$tweet_prefix $pics2tweet{$pic2twit}{title} $pics2tweet{$pic2twit}{shortUrl}";
+
+      # probably not necessary, but sanity check the lenght of the status update.
+      if ( length($status) > 140 ) {
+	$logfile and _write_log(*LOG,"Truncating picture title as tweet exceeds 140 characters");
+	my $truncate   = length($pics2tweet{$pic2twit}{title}) - ( length($status) - 137 );
+	my $new_title  = substr($pics2tweet{$pic2twit}{title},0,$truncate);
+	$new_title    .= '...';
+	$status        = "$tweet_prefix $new_title $pics2tweet{$pic2twit}{shortUrl}";
+      }
+
+      # Attempt to send the tweet:
+      if ( _send_tweet("$status","$twitter_username","$twitter_password") ) {
+	# on successful tweet, add the picture's data to the cache.
+	$cache{$pic2twit} = $pics2tweet{$pic2twit};
+	delete $pics2tweet{$pic2twit};
+	$logfile and _write_log(*LOG,"Tweeted $pic2twit with status $status");
+      }
+      else {
+	$logfile and _write_log(*LOG,"Tweet failed for $pic2twit (\"$pics2tweet{$pic2twit}{title}\").");
+      }
+    }
+  }
+  else {
+    $logfile and _write_log(*LOG,'$first_run = 1 and $twit_on_first_run = 0, so not tweeting anything.')
+  }
+
+  # Now we need to write out that cache file.  If $first_run but not $twit_on_first_run,
+  # Then we simple use the %pics2tweet hash.  Otherwise, regardless of whether this is 
+  # first_run of not, we just use %cache.  It's worth noting that any failed twits will
+  # not be in the %cache hash, so they will be retried on the next run if they are still 
+  # present as entries in the atom feed from Flickr.
+  ( $first_run and ( ! $twit_on_first_run ) )
+    ? store \%pics2tweet, $cachefile
+      : ( %cache and store \%cache, $cachefile );
+}
+else {
+  $logfile and _write_log(*LOG,"No pictures to tweet this time.");
+}
+# clean up and exit.
+unless ( _close_lockfile(*LOCKFILE,"$lockfile") ) {
+  if ( $logfile ) {
+    _write_log(*LOG,"Problem closing lockfile.");
+  }
+}
+$logfile and close(LOG);
+exit 0;
+__END__
